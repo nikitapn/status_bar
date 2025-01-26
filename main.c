@@ -9,12 +9,14 @@
 #include <pthread.h>
 #include <errno.h>
 
-#define MAX_BLOCKS     3
 #define MAX_BLOCK_SIZE 128
 #define MAX_STATUS_LEN 1024
+#define LEFT_BORDER "^c#dddddd^["
+#define RIGHT_BORDER "^c#dddddd^]"
+
 
 enum Block : int {
-  Memory = 0, Battery, Date
+  Battery, Memory, Date, MAX_BLOCKS
 };
 
 static Display *dpy;
@@ -38,13 +40,16 @@ static void update(enum Block bix, const char* str) {
   memcpy(blocks[bix].data, str, blen);
 
   char *ptr = status;
+  memcpy(ptr, LEFT_BORDER, sizeof(LEFT_BORDER) - 1);
+  ptr += sizeof(LEFT_BORDER) - 1;
   for (int i = 0; i < MAX_BLOCKS; ++i) {
     const int len = blocks[i].len;
     if (!len) continue;
     memcpy(ptr, blocks[i].data, len);
     ptr += len;
   }
-  *ptr = '\0';
+
+  memcpy(ptr, RIGHT_BORDER, sizeof(RIGHT_BORDER));
 
   XStoreName(dpy, root, status);
 
@@ -72,7 +77,6 @@ static void* time_thread(void* /* params */) {
       (date->tm_hour >= 8 && date->tm_hour < 21 ? "^c#edd238^\uf185" : "^c#ecede8^\uf186"),
       date->tm_hour, 
       date->tm_min
-//      date->tm_year + 1900
     );
 
     update(Date, str);
@@ -108,36 +112,27 @@ static void* memory_status(void* /* params */) {
     }
 
     char line[256];
-    unsigned long memTotal = 0, memFree = 0, buffers = 0, cached = 0, SReclaimable = 0;
+    unsigned long memTotal = 0, memFree = 0, buffers = 0, cached = 0, memReclaimable = 0;
 
-    int i = 0;
-    while (fgets(line, sizeof(line), file)) {
+    for (int i = 0; fgets(line, sizeof(line), file);) {
+      if (i == 5) break;
       if (
           (sscanf(line, "MemTotal: %lu kB", &memTotal) == 1) ||
           (sscanf(line, "MemFree: %lu kB", &memFree) == 1)   ||
           (sscanf(line, "Buffers: %lu kB", &buffers) == 1)   ||
           (sscanf(line, "Cached: %lu kB", &cached) == 1)     ||
-          (sscanf(line, "SReclaimable: %lu kB", &SReclaimable) == 1)
+          (sscanf(line, "SReclaimable: %lu kB", &memReclaimable) == 1)
            ) ++i;
-      if (i == 5)
-        break;
     }
 
     fclose(file);
 
-    unsigned long mem_cached_all = cached + SReclaimable;
+    unsigned long memCachedAll = cached + memReclaimable;
 
-//    printf("Total Memory: %lu KB\n", memTotal);
-//    printf("Free Memory: %lu KB\n", memFree);
-//    printf("Buffers: %lu KB\n", buffers);
-//    printf("Cached: %lu KB\n", cached);
-//    printf("Used: %lu KB\n", memTotal - memFree - mem_cached_all);
-//    printf("Used1: %.1f Gb\n", round((float)(memTotal - memFree - mem_cached_all) / 1024.0f / 1024.f * 10.0f) / 10.f);
-//    printf("Available Memory: %lu KB\n", memFree + buffers + cached);
-
-    char result[30];
-    sprintf(result, " %.1f Gb", (memTotal - memFree - mem_cached_all) / 1000.0f / 1000.f);
+    char result[MAX_BLOCK_SIZE];
+    sprintf(result, "^c#186da5^ \uf2db %.1fGB", (memTotal - memFree - memCachedAll) / 1000.0f / 1000.f);
     update(Memory, result);
+
     sleep(5);
   }
   return NULL;
@@ -163,8 +158,54 @@ static void populate_with_initial_values() {
   }
 }
 
-int main()
-{
+static int monitor_battery() {
+  struct udev *udev;
+  struct udev_device *dev;
+  struct udev_monitor *mon;
+
+  udev = udev_new();
+  if (!udev) {
+    fprintf(stderr, "Can't create udev\n");
+    return EXIT_FAILURE;
+  }
+
+  mon = udev_monitor_new_from_netlink(udev, "udev");
+  if (udev_monitor_filter_add_match_subsystem_devtype(mon, "power_supply", NULL) != 0) {
+    fprintf(stderr, "udev_monitor_filter_add_match_subsystem_devtype() failed.");
+    return EXIT_FAILURE;
+  }
+  udev_monitor_enable_receiving(mon);
+
+  struct pollfd items[1];
+  items[0].fd = udev_monitor_get_fd(mon);
+  items[0].events = POLLIN;
+  items[0].revents = 0;
+
+  while (poll(items, 1, -1) > 0) {
+    dev = udev_monitor_receive_device(mon);
+    if (dev) {
+      /*for (struct udev_list_entry *list = udev_device_get_properties_list_entry(dev);
+        list != NULL;
+        list = udev_list_entry_get_next(list)) {
+        printf("%s: %s\n", udev_list_entry_get_name(list), udev_list_entry_get_value(list));
+      }*/
+      const char *capacity = udev_device_get_property_value(dev, "POWER_SUPPLY_CAPACITY");
+      if (capacity) {
+        static char str[MAX_BLOCK_SIZE];
+        memcpy(str, get_battery_icon(capacity), sizeof(battery_icon[0]) - 1);
+        sprintf(str + sizeof(battery_icon[0]) - 1, " %s%%", capacity);
+        update(Battery, str);
+      }
+      udev_device_unref(dev);
+    }
+  }
+
+  udev_unref(udev);
+
+  return EXIT_SUCCESS;
+}
+
+int main() {
   if (0 != (errno = pthread_mutex_init(&mutex, NULL))) {
     perror("pthread_mutex_init() failed");
     return EXIT_FAILURE;
@@ -180,57 +221,5 @@ int main()
   pthread_create(&thread_time, NULL, &time_thread, NULL);
   pthread_create(&thread_memory, NULL, &memory_status, NULL);
 
-  struct udev *udev;
-  struct udev_device *dev;
-  struct udev_monitor *mon;
-
-  /* create udev object */
-  udev = udev_new();
-  if (!udev)
-  {
-    fprintf(stderr, "Can't create udev\n");
-    return 1;
-  }
-
-  mon = udev_monitor_new_from_netlink(udev, "udev");
-  if (udev_monitor_filter_add_match_subsystem_devtype(mon, "power_supply", NULL) != 0)
-  {
-    fprintf(stderr, "udev_monitor_filter_add_match_subsystem_devtype() failed.");
-    return 1;
-  }
-  udev_monitor_enable_receiving(mon);
-
-  struct pollfd items[1];
-  items[0].fd = udev_monitor_get_fd(mon);
-  items[0].events = POLLIN;
-  items[0].revents = 0;
-
-  while (poll(items, 1, -1) > 0)
-  {
-    dev = udev_monitor_receive_device(mon);
-
-    if (dev)
-    {
-      /*for (struct udev_list_entry *list = udev_device_get_properties_list_entry(dev);
-        list != NULL;
-        list = udev_list_entry_get_next(list)) {
-        printf("%s: %s\n", udev_list_entry_get_name(list), udev_list_entry_get_value(list));
-      }*/
-
-      const char *capacity = udev_device_get_property_value(dev, "POWER_SUPPLY_CAPACITY");
-      if (capacity)
-      {
-        static char str[MAX_BLOCK_SIZE];
-        memcpy(str, get_battery_icon(capacity), sizeof(battery_icon[0]) - 1);
-        sprintf(str + sizeof(battery_icon[0]) - 1, " %s%%", capacity);
-        update(Battery, str);
-      }
-
-      udev_device_unref(dev);
-    }
-  }
-
-  udev_unref(udev);
-
-  return 0;
+  return monitor_battery();
 }
