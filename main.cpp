@@ -26,7 +26,16 @@
 #define LEFT_BORDER    "^c#dddddd^["
 #define RIGHT_BORDER   "^c#dddddd^]"
 
-enum class BlockId : int { Weather, Battery, Memory, Date, MAX_BLOCKS };
+using json = nlohmann::json;
+
+enum class BlockId : int {
+  Weather,
+  ExchangeRate,
+  Battery,
+  Memory,
+  Date,
+  MAX_BLOCKS
+};
 constexpr int MAX_BLOCKS = static_cast<int>(BlockId::MAX_BLOCKS);
 
 static Display        *dpy;
@@ -207,38 +216,130 @@ class Memory : public Waitable<Memory>
   void start() { memory_status(); }
 };
 
-class Weather : public Waitable<Weather>
+class RestApi : public Waitable<RestApi>
 {
-  friend Waitable<Weather>;
+  friend Waitable<RestApi>;
 
-  static constexpr auto is_test           = false;
-  static constexpr auto sync_interval_sec = is_test ? 10 : 3600;
-  static constexpr auto LAST_SYNC_FILE =
-    "/home/nikita/.cache/statusbar/last_sync";
-  std::string url_;
+  BlockId     block_id_;
+  std::string block_name_;
+  std::string cache_file_;
+  int         refresh_interval_;
 
-  struct LastSync {
-    double temperature;
-    time_t timestamp;
-  } last_sync_;
+  std::string                    url_;
+  std::pair<time_t, std::string> last_sync_;
 
   auto get_now() { return time(NULL); }
 
   void store_last_sync(
-    double temperature)
+    std::string &&value)
   {
-    last_sync_.temperature = temperature;
-    last_sync_.timestamp   = get_now();
-    std::ofstream ofs(LAST_SYNC_FILE);
+    last_sync_.first  = get_now();
+    last_sync_.second = std::move(value);
+    std::ofstream ofs(cache_file_);
     if (ofs.is_open()) {
-      ofs << last_sync_.temperature << " " << last_sync_.timestamp;
+      ofs << last_sync_.second << "\n" << last_sync_.first;
       ofs.close();
     }
   }
 
-  void timer_task() { is_test ? test_fetch_weather() : fetch_weather(); }
+  void timer_task() { perform_request(); }
 
-  std::string build_url()
+  static size_t WriteCallback(
+    void *contents, size_t size, size_t nmemb, std::string *output)
+  {
+    size_t totalSize = size * nmemb;
+    output->append((char *)contents, totalSize);
+    return totalSize;
+  }
+
+  void perform_request()
+  {
+    CURL       *curl;
+    CURLcode    res;
+    std::string readBuffer;
+
+    curl = curl_easy_init();
+    if (curl) {
+      curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
+      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, RestApi::WriteCallback);
+      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
+      res = curl_easy_perform(curl);
+      curl_easy_cleanup(curl);
+
+      if (res == CURLE_OK) {
+        try {
+          json data   = json::parse(readBuffer);
+          auto result = build_result(data);
+          update(block_id_, result.c_str());
+          store_last_sync(std::move(result));
+        } catch (json::parse_error &e) {
+          std::cerr << "JSON parsing error: " << e.what() << std::endl;
+        }
+      } else {
+        std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res)
+                  << std::endl;
+      }
+    }
+    start_timer(refresh_interval_);
+  }
+
+ protected:
+  virtual std::string build_url()                    = 0;
+  virtual std::string build_result(const json &data) = 0;
+
+ public:
+  void start()
+  {
+    url_ = build_url();
+    if (url_.empty()) return;
+    int  wait_for = 0;
+    auto diff     = get_now() - last_sync_.first;
+    if (last_sync_.first != 0ul && diff < refresh_interval_) {
+      update(block_id_, last_sync_.second.c_str());
+      wait_for = refresh_interval_ - diff;
+      std::cout << block_name_ << " block will be updated in " << wait_for
+                << " seconds" << std::endl;
+    }
+    start_timer(wait_for);
+  }
+
+  RestApi(
+    boost::asio::io_context &ioc,
+    BlockId                  block_id,
+    std::string_view         block_name,
+    std::string_view         cache_file,
+    int                      refresh_interval)
+      : Waitable {ioc},
+        block_id_ {block_id},
+        block_name_ {block_name},
+        cache_file_ {cache_file},
+        refresh_interval_ {refresh_interval}
+  {
+    std::ifstream ifs(cache_file_);
+    if (ifs.is_open()) {
+      getline(ifs, last_sync_.second);
+      ifs >> last_sync_.first;
+      std::cout << last_sync_.second << std::endl;
+      std::cout << last_sync_.first << std::endl;
+      auto now = get_now();
+      std::cout << "Last " << block_name_ << " request: " << last_sync_.second
+                << ", " << now - last_sync_.first << " seconds ago"
+                << std::endl;
+      ifs.close();
+    } else {
+      last_sync_.first = 0ul;
+    }
+  }
+};
+
+class Weather : public RestApi
+{
+  static constexpr auto block_name        = "Weather";
+  static constexpr auto sync_interval_sec = 3600;
+  static constexpr auto cache_file = "/home/nikita/.cache/statusbar/weather";
+
+ protected:
+  virtual std::string build_url() override
   {
     // MY_LOCATION has the format "latitude,longitude"
     // Example: "37.7749,-122.4194"
@@ -260,17 +361,10 @@ class Weather : public Waitable<Weather>
            "&longitude=" + longitude + "&current_weather=true";
   }
 
-  static size_t WriteCallback(
-    void *contents, size_t size, size_t nmemb, std::string *output)
+  virtual std::string build_result(
+    const json &data) override
   {
-    size_t totalSize = size * nmemb;
-    output->append((char *)contents, totalSize);
-    return totalSize;
-  }
-
-  std::string build_result(
-    double temperature)
-  {
+    double temperature = data["current_weather"]["temperature"];
     /*
       Temperature    Color        Hex Code
       ❄️ Freezing    Dark Blue    #1E90FF (Dodger Blue)
@@ -280,7 +374,7 @@ class Weather : public Waitable<Weather>
       🌡️ Warm        Orange       #FFA500 (Bright Orange)
       🔥 Very Hot    Red          #FF4500 (Orange-Red)
     */
-    auto choose_icon = [](double temperature) {
+    auto choose_icon   = [](double temperature) {
       if (temperature < 0) return "^c#1e90ff^ \uf2cb";   // empty
       if (temperature < 10) return "^c#00bfff^ \uf2ca";  // quarted
       if (temperature < 18) return "^c#32cd32^ \uf2c9";  // half
@@ -292,78 +386,56 @@ class Weather : public Waitable<Weather>
       "{} {:.{}f}°C", choose_icon(temperature), temperature, 1);
   }
 
-  void fetch_weather()
+ public:
+  Weather(
+    boost::asio::io_context &ioc)
+      : RestApi(ioc, BlockId::Weather, block_name, cache_file, sync_interval_sec)
   {
-    using json = nlohmann::json;
+  }
+};
 
-    CURL       *curl;
-    CURLcode    res;
-    std::string readBuffer;
+class ExchangeRate : public RestApi
+{
+  static constexpr auto block_name        = "ExchangeRate";
+  static constexpr auto sync_interval_sec = 3600;
+  static constexpr auto cache_file =
+    "/home/nikita/.cache/statusbar/exchange_rate";
+  static constexpr auto base_currency = "USD";
+  static constexpr char rates[][4]    = {"TRY", "RUB"};
 
-    curl = curl_easy_init();
-    if (curl) {
-      curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
-      curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, Weather::WriteCallback);
-      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-      res = curl_easy_perform(curl);
-      curl_easy_cleanup(curl);
-
-      if (res == CURLE_OK) {
-        try {
-          json   weatherData = json::parse(readBuffer);
-          double temperature = weatherData["current_weather"]["temperature"];
-          update(BlockId::Weather, build_result(temperature).c_str());
-          store_last_sync(temperature);
-        } catch (json::parse_error &e) {
-          std::cerr << "JSON parsing error: " << e.what() << std::endl;
-        }
-      } else {
-        std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res)
-                  << std::endl;
-      }
+ protected:
+  virtual std::string build_url() override
+  {
+    const char *api_key = getenv("OPENEXCHANGERATES_API_KEY");
+    if (!api_key) {
+      std::cerr << "`OPENEXCHANGERATES_API_KEY` environment variable is not "
+                   "set. ExchangeRate block "
+                   "will not be used."
+                << std::endl;
+      return "";
     }
-    start_timer(sync_interval_sec);
+    using std::string_literals::operator""s;
+    return "https://openexchangerates.org/api/latest.json?app_id="s + api_key;
   }
 
-  void test_fetch_weather()
+  virtual std::string build_result(
+    const json &data) override
   {
-    auto temp = -10.0 + (rand() % 100) / 100.0 * 60.0;
-    update(BlockId::Weather, build_result(temp).c_str());
-    store_last_sync(temp);
-    start_timer(sync_interval_sec);
+    // TODO: handle errors and possible crashes during parsing
+    // if unexpected response is received
+    std::string result;
+    for (const auto &rate : rates) {
+      double value = data["rates"][rate];
+      result += fmt::format(" ^c#07d7e8^{} ^c#10bbbb^{:.2f}", rate, value);
+    }
+    return result;
   }
 
  public:
-  void start()
-  {
-    url_ = build_url();
-    if (url_.empty()) return;
-    int  wait_for = 0;
-    auto diff     = get_now() - last_sync_.timestamp;
-    if (last_sync_.timestamp != 0ul && diff < sync_interval_sec) {
-      update(BlockId::Weather, build_result(last_sync_.temperature).c_str());
-      wait_for = sync_interval_sec - diff;
-      std::cout << "Weather block will be updated in " << wait_for << " seconds"
-                << std::endl;
-    }
-    start_timer(wait_for);
-  }
-
-  Weather(
+  ExchangeRate(
     boost::asio::io_context &ioc)
-      : Waitable {ioc}
+      : RestApi(ioc, BlockId::ExchangeRate, block_name, cache_file, sync_interval_sec)
   {
-    std::ifstream ifs(LAST_SYNC_FILE);
-    if (ifs.is_open()) {
-      ifs >> last_sync_.temperature >> last_sync_.timestamp;
-      auto now = get_now();
-      std::cout << "Last weather request: " << last_sync_.temperature << "°C, "
-                << now - last_sync_.timestamp << " seconds ago" << std::endl;
-      ifs.close();
-    } else {
-      last_sync_.temperature = 0.0;
-      last_sync_.timestamp   = 0ul;
-    }
   }
 };
 
@@ -557,14 +629,16 @@ int main()
   std::array<std::thread, MAX_THREADS> threads;
   for (auto &t : threads) t = std::thread([&ioc]() { ioc.run(); });
 
-  Date    date(ioc);
-  Memory  memory(ioc);
-  Weather weather(ioc);
-  Battery battery;
+  Date         date(ioc);
+  Memory       memory(ioc);
+  Weather      weather(ioc);
+  ExchangeRate exchange(ioc);
+  Battery      battery;
 
   date.start();
   memory.start();
   weather.start();
+  exchange.start();
 
   boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
   signals.async_wait([&](boost::system::error_code const &, int) {
@@ -572,6 +646,7 @@ int main()
     date.cancel_timer();
     memory.cancel_timer();
     weather.cancel_timer();
+    exchange.cancel_timer();
     ioc.stop();
   });
 
