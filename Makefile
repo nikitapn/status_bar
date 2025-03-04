@@ -1,12 +1,14 @@
 TARGET := status_bar
 CC := gcc
-LIB := -ludev -lX11 -lstdc++ -lcurl -lfmt
+LIBS := -ludev -lX11 -lstdc++ -lcurl -lfmt
 CXXFLAGS := -Wall -Wextra -O2
 
 all: $(TARGET)
 
 $(TARGET): main.cpp
-	$(CC) $(CXXFLAGS) -o $@ main.cpp $(LIB)
+	$(CC) $(CXXFLAGS) -o $@ main.cpp $(LIBS)
 
 clean:
-	rm $(TARGET)
+	rm -f $(TARGET)
+
+.PHONY: all clean

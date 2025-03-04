@@ -42,8 +42,9 @@ struct BlockData {
 static void update(
   BlockId bix, const char *str)
 {
-  static char             status[MAX_STATUS_LEN] = "";
-  static struct BlockData blocks[MAX_BLOCKS]     = {};
+  static char             status[2][MAX_STATUS_LEN] = {"", ""};
+  static bool             current_status            = 0;
+  static struct BlockData blocks[MAX_BLOCKS]        = {};
 
   pthread_mutex_lock(&mutex);
 
@@ -51,7 +52,7 @@ static void update(
   blocks[static_cast<size_t>(bix)].len = blen;
   memcpy(blocks[static_cast<size_t>(bix)].data, str, blen);
 
-  char *ptr = status;
+  char *ptr = status[!current_status];
   memcpy(ptr, LEFT_BORDER, sizeof(LEFT_BORDER) - 1);
   ptr += sizeof(LEFT_BORDER) - 1;
   for (int i = 0; i < MAX_BLOCKS; ++i) {
@@ -61,12 +62,18 @@ static void update(
     ptr += len;
   }
 
-  // TODO: don't update if previous status is the same
   memcpy(ptr, RIGHT_BORDER, sizeof(RIGHT_BORDER));
 
-  // std::cout << status << std::endl;
+  ptr = status[!current_status];
+  if (strcmp(ptr, status[current_status]) == 0) {
+    pthread_mutex_unlock(&mutex);
+    return;
+  }
 
-  XStoreName(dpy, root, status);
+  current_status = !current_status;
+
+  // std::cout << ptr << std::endl;
+  XStoreName(dpy, root, ptr);
 
   pthread_mutex_unlock(&mutex);
   XFlush(dpy);
@@ -148,25 +155,6 @@ class Date : public Waitable<Date>
   void start() { do_time(); }
 };
 
-static const char battery_icon[][16] = {
-  "^c#ff0000^ \uf244 ",
-  "^c#eb9634^ \uf243 ",
-  "^c#ebd334^ \uf242 ",
-  "^c#c6eb34^ \uf241 ",
-  "^c#00ff00^ \uf240 ",
-};
-
-static const char *get_battery_icon(
-  const char *str)
-{
-  int value = atoi(str);
-  if (value < 10) return battery_icon[0];
-  if (value >= 10 && value < 25) return battery_icon[1];
-  if (value >= 25 && value < 50) return battery_icon[2];
-  if (value >= 50 && value < 75) return battery_icon[3];
-  return battery_icon[4];
-}
-
 class Memory : public Waitable<Memory>
 {
   friend Waitable<Memory>;
@@ -221,11 +209,11 @@ class Weather : public Waitable<Weather>
 {
   friend Waitable<Weather>;
 
-  static constexpr auto is_test = false;
+  static constexpr auto is_test           = false;
   static constexpr auto sync_interval_sec = is_test ? 10 : 3600;
   static constexpr auto LAST_SYNC_FILE =
     "/home/nikita/.cache/statusbar/last_sync";
-  std::string           url_;
+  std::string url_;
 
   struct LastSync {
     double temperature;
@@ -254,18 +242,18 @@ class Weather : public Waitable<Weather>
     // Example: "37.7749,-122.4194"
     const char *location = getenv("MY_LOCATION");
     if (!location) {
-      std::cerr << "MY_LOCATION environment variable is not set. Weather block "
-                   "will not be used."
-                << std::endl;
+      std::cerr
+        << "`MY_LOCATION` environment variable is not set. Weather block "
+           "will not be used."
+        << std::endl;
       return "";
     }
 
-    // MY_LOCATION has the format "latitude,longitude"
-    // Example: "37.7749,-122.4194"
     std::string location_str(location);
     std::string latitude  = location_str.substr(0, location_str.find(","));
     std::string longitude = location_str.substr(location_str.find(",") + 1);
 
+    // TODO: add humudity, wind speed, etc.
     return "https://api.open-meteo.com/v1/forecast?latitude=" + latitude +
            "&longitude=" + longitude + "&current_weather=true";
   }
@@ -348,16 +336,15 @@ class Weather : public Waitable<Weather>
   {
     url_ = build_url();
     if (url_.empty()) return;
-
-    auto diff = get_now() - last_sync_.timestamp;
-    if (last_sync_.timestamp == 0 || diff > sync_interval_sec) {
-      start_timer(0);
-    } else {
+    int  wait_for = 0;
+    auto diff     = get_now() - last_sync_.timestamp;
+    if (last_sync_.timestamp != 0ul && diff < sync_interval_sec) {
       update(BlockId::Weather, build_result(last_sync_.temperature).c_str());
-      start_timer(sync_interval_sec - diff);
-      std::cout << "Weather block will be updated in " << sync_interval_sec - diff << " seconds"
+      wait_for = sync_interval_sec - diff;
+      std::cout << "Weather block will be updated in " << wait_for << " seconds"
                 << std::endl;
     }
+    start_timer(wait_for);
   }
 
   Weather(
@@ -378,25 +365,43 @@ class Weather : public Waitable<Weather>
   }
 };
 
-static const char *get_bolt(
-  const char *str)
+class Battery
 {
-  return strcmp(str, "Charging") == 0 ? " ^c#cccccc^\uf0e7" : "";
-}
+  const char *get_battery_icon(
+    const char *str)
+  {
+    static const char battery_icon[][16] = {
+      "^c#ff0000^ \uf244 ",
+      "^c#eb9634^ \uf243 ",
+      "^c#ebd334^ \uf242 ",
+      "^c#c6eb34^ \uf241 ",
+      "^c#00ff00^ \uf240 ",
+    };
+    int value = atoi(str);
+    if (value < 10) return battery_icon[0];
+    if (value >= 10 && value < 25) return battery_icon[1];
+    if (value >= 25 && value < 50) return battery_icon[2];
+    if (value >= 50 && value < 75) return battery_icon[3];
+    return battery_icon[4];
+  }
 
-static void populate_with_initial_values(
-  void)
-{
-  {  // init battery status
-    static char str[MAX_BLOCK_SIZE];
-    char        capacity[5] = "---";
-    FILE       *fp = fopen("/sys/class/power_supply/BAT0/capacity", "r");
+  const char *get_bolt(
+    const char *str)
+  {
+    return strcmp(str, "Charging") == 0 ? " ^c#cccccc^\uf0e7" : "";
+  }
+
+  void init()
+  {
+    char  str[MAX_BLOCK_SIZE];
+    char  capacity[5] = "---";
+    FILE *fp          = fopen("/sys/class/power_supply/BAT0/capacity", "r");
     if (fp) {
       fgets(capacity, 5, fp);
       int len = (int)ftell(fp);
       if (len > 1) {
         capacity[len - 1] = '\0';
-        memcpy(str, get_battery_icon(capacity), sizeof(battery_icon[0]) - 1);
+        memcpy(str, get_battery_icon(capacity), 16 - 1);
       }
       fclose(fp);
     }
@@ -413,13 +418,10 @@ static void populate_with_initial_values(
         fclose(fp);
       }
     }
-    sprintf(str + sizeof(battery_icon[0]) - 1, "%s%%%s", capacity, charging);
+    sprintf(str + 16 - 1, "%s%%%s", capacity, charging);
     update(BlockId::Battery, str);
   }
-}
 
-class Battery
-{
   void monitor_battery()
   {
     struct udev         *udev;
@@ -473,8 +475,8 @@ class Battery
         }
         if (capacity || status) {
           static char str[MAX_BLOCK_SIZE];
-          memcpy(str, get_battery_icon(level), sizeof(battery_icon[0]) - 1);
-          sprintf(str + sizeof(battery_icon[0]) - 1, "%s%%%s", level, bolt);
+          memcpy(str, get_battery_icon(level), 16 - 1);
+          sprintf(str + 16 - 1, "%s%%%s", level, bolt);
           update(BlockId::Battery, str);
         }
         udev_device_unref(dev);
@@ -485,7 +487,11 @@ class Battery
   }
 
  public:
-  void run() { monitor_battery(); }
+  void run()
+  {
+    init();
+    monitor_battery();
+  }
 };
 
 int main()
@@ -495,11 +501,13 @@ int main()
     return EXIT_FAILURE;
   }
 
-  dpy    = XOpenDisplay(NULL);
+  dpy = XOpenDisplay(NULL);
+  if (!dpy) {
+    fprintf(stderr, "Cannot open display\n");
+    return EXIT_FAILURE;
+  }
   screen = DefaultScreen(dpy);
   root   = RootWindow(dpy, screen);
-
-  populate_with_initial_values();
 
   boost::asio::io_context ioc;
 
