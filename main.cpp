@@ -18,6 +18,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/deadline_timer.hpp>
 #include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <fstream>
 
 #define MAX_BLOCK_SIZE 128
@@ -90,12 +91,11 @@ class Waitable
     int wait_for)
   {
     timer_.expires_from_now(boost::posix_time::seconds(wait_for));
-    timer_.async_wait([this](const boost::system::error_code &) {
-      static_cast<T *>(this)->timer_task();
+    timer_.async_wait([this](const boost::system::error_code &ec) {
+      if (ec != boost::asio::error::operation_aborted)
+        static_cast<T *>(this)->timer_task();
     });
   }
-
-  void cancel_timer() { timer_.cancel(); }
 
  public:
   Waitable(
@@ -103,6 +103,8 @@ class Waitable
       : timer_ {ioc}
   {
   }
+
+  void cancel_timer() { timer_.cancel(); }
 };
 
 class Date : public Waitable<Date>
@@ -367,8 +369,10 @@ class Weather : public Waitable<Weather>
 
 class Battery
 {
-  const char *get_battery_icon(
-    const char *str)
+  std::atomic_bool exit_flag_ = 0;
+  int              event_fd_  = -1;
+  const char      *get_battery_icon(
+         const char *str)
   {
     static const char battery_icon[][16] = {
       "^c#ff0000^ \uf244 ",
@@ -443,54 +447,89 @@ class Battery
     }
     udev_monitor_enable_receiving(mon);
 
-    struct pollfd items[1];
+    struct pollfd items[2];
     items[0].fd      = udev_monitor_get_fd(mon);
     items[0].events  = POLLIN;
     items[0].revents = 0;
 
+    event_fd_ = eventfd(0, EFD_NONBLOCK);
+    if (event_fd_ == -1) {
+      perror("eventfd");
+      return;
+    }
+
+    items[1].fd     = event_fd_;
+    items[1].events = POLLIN;
+
     const char *bolt      = "";
     char        level[16] = "";
-    while (poll(items, 1, -1) > 0) {
-      dev = udev_monitor_receive_device(mon);
-      if (dev) {
-        /*for (struct udev_list_entry *list =
-        udev_device_get_properties_list_entry(dev); list != NULL; list =
-        udev_list_entry_get_next(list)) { printf("%s: %s\n",
-        udev_list_entry_get_name(list), udev_list_entry_get_value(list));
-        }*/
-        const char *capacity =
-          udev_device_get_property_value(dev, "POWER_SUPPLY_CAPACITY");
-        const char *status =
-          udev_device_get_property_value(dev, "POWER_SUPPLY_STATUS");
-        const char *online =
-          udev_device_get_property_value(dev, "POWER_SUPPLY_ONLINE");
-        if (online) {
-          is_cable_plugged = (strcmp(online, "1") == 0);
+    while (!exit_flag_) {
+      int ret = poll(items, 2, -1);
+      if (ret < 0) {
+        perror("poll");
+        break;
+      }
+      if (items[1].revents & POLLIN) {
+        uint64_t val;
+        read(event_fd_, &val, sizeof(val));  // Clear eventfd
+        printf("Received SIGINT, exiting...\n");
+        break;
+      }
+      if (items[0].revents & POLLIN) {
+        dev = udev_monitor_receive_device(mon);
+        if (dev) {
+          /*for (struct udev_list_entry *list =
+          udev_device_get_properties_list_entry(dev); list != NULL; list =
+          udev_list_entry_get_next(list)) { printf("%s: %s\n",
+          udev_list_entry_get_name(list), udev_list_entry_get_value(list));
+          }*/
+          const char *capacity =
+            udev_device_get_property_value(dev, "POWER_SUPPLY_CAPACITY");
+          const char *status =
+            udev_device_get_property_value(dev, "POWER_SUPPLY_STATUS");
+          const char *online =
+            udev_device_get_property_value(dev, "POWER_SUPPLY_ONLINE");
+          if (online) {
+            is_cable_plugged = (strcmp(online, "1") == 0);
+          }
+          if (status) {
+            bolt = !is_cable_plugged ? "" : get_bolt(status);
+          }
+          if (capacity) {
+            strcpy(level, capacity);
+          }
+          if (capacity || status) {
+            static char str[MAX_BLOCK_SIZE];
+            memcpy(str, get_battery_icon(level), 16 - 1);
+            sprintf(str + 16 - 1, "%s%%%s", level, bolt);
+            update(BlockId::Battery, str);
+          }
+          udev_device_unref(dev);
         }
-        if (status) {
-          bolt = !is_cable_plugged ? "" : get_bolt(status);
-        }
-        if (capacity) {
-          strcpy(level, capacity);
-        }
-        if (capacity || status) {
-          static char str[MAX_BLOCK_SIZE];
-          memcpy(str, get_battery_icon(level), 16 - 1);
-          sprintf(str + 16 - 1, "%s%%%s", level, bolt);
-          update(BlockId::Battery, str);
-        }
-        udev_device_unref(dev);
       }
     }
 
+    close(event_fd_);
+    udev_monitor_unref(mon);
     udev_unref(udev);
+
+    exit_flag_ = 0;
+    event_fd_  = -1;
   }
 
  public:
   void run()
   {
+    if (exit_flag_) return;
     init();
     monitor_battery();
+  }
+  void stop()
+  {
+    if (!exit_flag_) return;
+    exit_flag_   = 1;
+    uint64_t val = 1;
+    write(event_fd_, &val, sizeof(val));  // Wake up poll()
   }
 };
 
@@ -514,10 +553,9 @@ int main()
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work(
     boost::asio::make_work_guard(ioc));
 
-  const int MAX_THREADS = 2;
-  for (int i = 0; i < MAX_THREADS; ++i) {
-    std::thread([&ioc]() { ioc.run(); }).detach();
-  }
+  const int                            MAX_THREADS = 2;
+  std::array<std::thread, MAX_THREADS> threads;
+  for (auto &t : threads) t = std::thread([&ioc]() { ioc.run(); });
 
   Date    date(ioc);
   Memory  memory(ioc);
@@ -527,6 +565,19 @@ int main()
   date.start();
   memory.start();
   weather.start();
+
+  boost::asio::signal_set signals(ioc, SIGINT, SIGTERM);
+  signals.async_wait([&](boost::system::error_code const &, int) {
+    battery.stop();
+    date.cancel_timer();
+    memory.cancel_timer();
+    weather.cancel_timer();
+    ioc.stop();
+  });
+
   battery.run();  // blocking
+
+  for (auto &t : threads) t.join();
+
   return 0;
 }
