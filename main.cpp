@@ -228,6 +228,10 @@ class RestApi : public Waitable<RestApi>
   std::string                    url_;
   std::pair<time_t, std::string> last_sync_;
 
+  constexpr static auto MAX_RETRY   = 3;
+  int                   retry_delay = 5;
+  int                   retry_count = 0;
+
   auto get_now() { return time(NULL); }
 
   void store_last_sync(
@@ -252,6 +256,14 @@ class RestApi : public Waitable<RestApi>
     return totalSize;
   }
 
+  void invalidate()
+  {
+    last_sync_.first = 0ul;
+    last_sync_.second.clear();
+    std::filesystem::remove(cache_file_);
+    update(block_id_, "");
+  }
+
   void perform_request()
   {
     CURL       *curl;
@@ -272,15 +284,36 @@ class RestApi : public Waitable<RestApi>
           auto result = build_result(data);
           update(block_id_, result.c_str());
           store_last_sync(std::move(result));
+          retry_delay = 5;
+          retry_count = 0;
         } catch (json::parse_error &e) {
           std::cerr << "JSON parsing error: " << e.what() << std::endl;
+          invalidate();
+        } catch (json::out_of_range &e) {
+          std::cerr << "Unexpected response: " << e.what() << std::endl;
+          invalidate();
+        } catch (std::exception &e) {
+          std::cerr << "Exception: " << e.what() << std::endl;
+          invalidate();
         }
+        start_timer(refresh_interval_);
       } else {
         std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res)
                   << std::endl;
+        if (retry_count++ >= MAX_RETRY) {
+          std::cerr << '[' << block_name_
+                    << "] Max retry count reached. Invalidate cache."
+                    << std::endl;
+          invalidate();
+          retry_delay = 5;
+          retry_count = 0;
+          start_timer(refresh_interval_);
+        } else {
+          start_timer(retry_delay);
+          if (retry_delay < 60) retry_delay *= 2;
+        }
       }
     }
-    start_timer(refresh_interval_);
   }
 
  protected:
@@ -319,8 +352,6 @@ class RestApi : public Waitable<RestApi>
     if (ifs.is_open()) {
       getline(ifs, last_sync_.second);
       ifs >> last_sync_.first;
-      std::cout << last_sync_.second << std::endl;
-      std::cout << last_sync_.first << std::endl;
       auto now = get_now();
       std::cout << "Last " << block_name_ << " request: " << last_sync_.second
                 << ", " << now - last_sync_.first << " seconds ago"
@@ -364,7 +395,7 @@ class Weather : public RestApi
   virtual std::string build_result(
     const json &data) override
   {
-    double temperature = data["current_weather"]["temperature"];
+    double temperature = data.at("current_weather").at("temperature");
     /*
       Temperature    Color        Hex Code
       ❄️ Freezing    Dark Blue    #1E90FF (Dodger Blue)
@@ -389,7 +420,8 @@ class Weather : public RestApi
  public:
   Weather(
     boost::asio::io_context &ioc)
-      : RestApi(ioc, BlockId::Weather, block_name, cache_file, sync_interval_sec)
+      : RestApi(
+          ioc, BlockId::Weather, block_name, cache_file, sync_interval_sec)
   {
   }
 };
@@ -421,11 +453,9 @@ class ExchangeRate : public RestApi
   virtual std::string build_result(
     const json &data) override
   {
-    // TODO: handle errors and possible crashes during parsing
-    // if unexpected response is received
     std::string result;
     for (const auto &rate : rates) {
-      double value = data["rates"][rate];
+      double value = data.at("rates").at(rate);
       result += fmt::format(" ^c#07d7e8^{} ^c#10bbbb^{:.2f}", rate, value);
     }
     return result;
@@ -434,7 +464,8 @@ class ExchangeRate : public RestApi
  public:
   ExchangeRate(
     boost::asio::io_context &ioc)
-      : RestApi(ioc, BlockId::ExchangeRate, block_name, cache_file, sync_interval_sec)
+      : RestApi(
+          ioc, BlockId::ExchangeRate, block_name, cache_file, sync_interval_sec)
   {
   }
 };
